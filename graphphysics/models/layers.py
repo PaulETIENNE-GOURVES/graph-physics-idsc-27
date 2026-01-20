@@ -116,6 +116,127 @@ def build_mlp(
     return nn.Sequential(*layers)
 
 
+class MoE(nn.Module):
+    """
+    Mixture of Experts (MoE) Layer.
+
+    This layer consists of multiple expert networks and a gating mechanism
+    to combine their outputs.
+    """
+
+    def __init__(
+        self,
+        in_size: int,
+        hidden_size: int,
+        out_size: int,
+        num_experts: int,
+        num_top_experts: int,
+        nb_of_layers: int = 2,
+        layer_norm: bool = True,
+        act: str = "relu",
+    ):
+        """
+        Initializes the MoE layer.
+
+        Args:
+            in_size (int): Size of the input features.
+            hidden_size (int): Size of the hidden layers in each expert.
+            out_size (int): Size of the output features.
+            num_experts (int): Number of expert networks.
+            nb_of_layers (int, optional): Number of layers in each expert network.
+                Defaults to 2.
+            layer_norm (bool, optional): Whether to apply RMS normalization to the
+                output layer. Defaults to True.
+            act (str, optional): Activation function to use ('relu' or 'gelu').
+                Defaults to 'relu'.
+        """
+        super().__init__()
+
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList(
+            [
+                build_mlp(
+                    in_size=in_size,
+                    hidden_size=hidden_size,
+                    out_size=out_size,
+                    nb_of_layers=nb_of_layers,
+                    layer_norm=layer_norm,
+                    act=act,
+                )
+                for _ in range(num_experts)
+            ]
+        )
+
+        # Define the gate as in the paper "Outrageously Large Neural Networks"
+        
+        self.gate_layer = nn.Linear(in_size, num_experts, bias=False)
+        self.noise_layer = nn.Linear(in_size, num_experts, bias=False)
+
+    def keeptopk(tensor, k):
+        topk_values, topk_indices = torch.topk(tensor, k, dim=-1)
+        mask = (- torch.ones_like(tensor) * torch.inf).scatter_(-1, topk_indices, 0)
+        return tensor + mask
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the MoE layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., in_size).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (..., out_size).
+        """
+        gate_logits = self.gate_layer(x)
+        gate_logits = gate_logits + torch.randn(()) * torch.nn.Functional.softplus(self.noise_layer(x))  # Shape: (..., num_experts)
+        gate_logits = self.keeptopk(gate_logits, self.num_top_experts) # Keep top-k logits
+        gate_weights = torch.softmax(gate_logits, dim=-1)  # Shape: (..., num_experts)
+
+        expert_outputs = torch.stack(
+            [expert(x) for expert in self.experts], dim=-2
+        )  # Shape: (..., num_experts, out_size)
+
+        # Weighted sum of expert outputs
+        output = expert_outputs * gate_weights.unsqueeze(-1) # Shape: (..., num_experts, out_size)
+        output = output.sum(dim=-2)  # Shape: (..., out_size)
+        return output
+
+
+def build_moe(
+    in_size: int,
+    hidden_size: int,
+    out_size: int,
+    num_experts: int = 10,
+    num_top_experts: int = 3,
+    nb_of_layers: int = 2,
+    layer_norm: bool = True,
+) -> nn.Module:
+    """
+    Builds a Mixture of Experts (MoE) layer.
+
+    Args:
+        in_size (int): Size of the input features.
+        hidden_size (int): Size of the hidden layers in each expert.
+        out_size (int): Size of the output features.
+        num_experts (int): Number of expert networks.
+        nb_of_layers (int, optional): Number of layers in each expert network.
+            Defaults to 2.
+        layer_norm (bool, optional): Whether to apply RMS normalization to the
+            output layer. Defaults to True.
+
+    Returns:
+        nn.Module: The constructed MoE model.
+    """
+    return MoE(
+        in_size=in_size,
+        hidden_size=hidden_size,
+        out_size=out_size,
+        num_experts=num_experts,
+        nb_of_layers=nb_of_layers,
+        layer_norm=layer_norm,
+    )
+
+
 class GatedMLP(nn.Module):
     """
     A Gated Multilayer Perceptron.
@@ -320,7 +441,7 @@ class GraphNetBlock(MessagePassing):
     """
 
     def __init__(
-        self, hidden_size: int, nb_of_layers: int = 4, layer_norm: bool = True
+        self, hidden_size: int, nb_of_layers: int = 3, layer_norm: bool = True
     ):
         """
         Initializes the GraphNetBlock.
@@ -328,21 +449,22 @@ class GraphNetBlock(MessagePassing):
         Args:
             hidden_size (int): The size of the hidden representations.
             nb_of_layers (int, optional): The number of layers in the MLPs.
-                Defaults to 4.
+                Defaults to 3.
             layer_norm (bool, optional): Whether to use layer normalization in the MLPs.
                 Defaults to True.
+            num_experts (int, optional): Number of experts in the MoE layers. Defaults to 6.
         """
         super().__init__(aggr="add", flow="source_to_target")
         edge_input_dim = 3 * hidden_size
         node_input_dim = 2 * hidden_size
-        self.edge_block = build_mlp(
+        self.edge_block = build_moe(
             in_size=edge_input_dim,
             hidden_size=hidden_size,
             out_size=hidden_size,
             nb_of_layers=nb_of_layers,
             layer_norm=layer_norm,
         )
-        self.node_block = build_mlp(
+        self.node_block = build_moe(
             in_size=node_input_dim,
             hidden_size=hidden_size,
             out_size=hidden_size,
