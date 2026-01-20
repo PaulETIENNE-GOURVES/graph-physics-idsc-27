@@ -188,7 +188,7 @@ class MoE(nn.Module):
             torch.Tensor: Output tensor of shape (..., out_size).
         """
         gate_logits = self.gate_layer(x)
-        gate_logits = gate_logits + torch.randn(()) * torch.nn.Functional.softplus(self.noise_layer(x))  # Shape: (..., num_experts)
+        gate_logits = gate_logits + torch.randn(()) * torch.nn.functional.softplus(self.noise_layer(x))  # Shape: (..., num_experts)
         gate_logits = self.keeptopk(gate_logits, self.num_top_experts) # Keep top-k logits
         gate_weights = torch.softmax(gate_logits, dim=-1)  # Shape: (..., num_experts)
 
