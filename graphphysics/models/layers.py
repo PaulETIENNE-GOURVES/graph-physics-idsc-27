@@ -232,6 +232,7 @@ def build_moe(
         hidden_size=hidden_size,
         out_size=out_size,
         num_experts=num_experts,
+        num_top_experts=num_top_experts,
         nb_of_layers=nb_of_layers,
         layer_norm=layer_norm,
     )
