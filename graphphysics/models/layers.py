@@ -153,6 +153,7 @@ class MoE(nn.Module):
         super().__init__()
 
         self.num_experts = num_experts
+        self.num_top_experts = num_top_experts
         self.experts = nn.ModuleList(
             [
                 build_mlp(
