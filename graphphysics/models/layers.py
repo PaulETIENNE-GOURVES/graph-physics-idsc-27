@@ -115,7 +115,11 @@ def build_mlp(
 
     return nn.Sequential(*layers)
 
-
+def keeptopk(tensor: torch.Tensor, k):
+    """Keeps the top-k values in the last dimension of the tensor."""
+    topk_values, topk_indices = torch.topk(tensor, k, dim=-1)
+    mask = (- torch.ones_like(tensor) * torch.inf).scatter_(-1, topk_indices, 0)
+    return tensor + mask
 class MoE(nn.Module):
     """
     Mixture of Experts (MoE) Layer.
@@ -173,11 +177,6 @@ class MoE(nn.Module):
         self.gate_layer = nn.Linear(in_size, num_experts, bias=False)
         self.noise_layer = nn.Linear(in_size, num_experts, bias=False)
 
-    def keeptopk(tensor, k):
-        topk_values, topk_indices = torch.topk(tensor, k, dim=-1)
-        mask = (- torch.ones_like(tensor) * torch.inf).scatter_(-1, topk_indices, 0)
-        return tensor + mask
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the MoE layer.
@@ -190,7 +189,7 @@ class MoE(nn.Module):
         """
         gate_logits = self.gate_layer(x)
         gate_logits = gate_logits + torch.randn(()) * torch.nn.functional.softplus(self.noise_layer(x))  # Shape: (..., num_experts)
-        gate_logits = self.keeptopk(gate_logits, self.num_top_experts) # Keep top-k logits
+        gate_logits = keeptopk(gate_logits, self.num_top_experts) # Keep top-k logits
         gate_weights = torch.softmax(gate_logits, dim=-1)  # Shape: (..., num_experts)
 
         expert_outputs = torch.stack(
