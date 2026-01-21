@@ -206,8 +206,8 @@ def build_moe(
     in_size: int,
     hidden_size: int,
     out_size: int,
-    num_experts: int = 10,
-    num_top_experts: int = 3,
+    num_experts: int = 6,
+    num_top_experts: int = 2,
     nb_of_layers: int = 2,
     layer_norm: bool = True,
 ) -> nn.Module:
@@ -442,7 +442,7 @@ class GraphNetBlock(MessagePassing):
     """
 
     def __init__(
-        self, hidden_size: int, nb_of_layers: int = 3, layer_norm: bool = True
+        self, hidden_size: int, nb_of_layers: int = 2, layer_norm: bool = True
     ):
         """
         Initializes the GraphNetBlock.
