@@ -195,43 +195,19 @@ class MoE(nn.Module):
         )
         topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)
 
-        # ---- Token duplication ----
-        x_rep = x.repeat_interleave(self.num_top_experts, dim=0)
-        weights = topk_weights.reshape(-1)
-        expert_ids = topk_idx.reshape(-1)
-        token_ids = torch.arange(N, device=x.device).repeat_interleave(
-            self.num_top_experts
-        )
-
-        # ---- Count tokens per expert ----
-        counts = torch.bincount(
-            expert_ids, minlength=self.num_experts
-        )
-
-        # ---- Output buffer ----
-        output = torch.zeros(N, self.out_size, device=x.device, dtype=x.dtype)
-
-        # ---- Expert forwards (SAFE, NO MASKS) ----
-        start = 0
-        for expert_id, count in enumerate(counts.tolist()):
-            if count == 0:
-                continue
-
-            # select tokens for this expert
-            idx = (expert_ids == expert_id).nonzero(as_tuple=True)[0]
-
-            expert_input = x_rep[idx]
-            expert_output = self.experts[expert_id](expert_input)
-            expert_output *= weights[idx].unsqueeze(-1)
-
-            output.index_add_(0, token_ids[idx], expert_output)
-
-        # ---- CV (unchanged) ----
+       
         gate_weights = torch.zeros_like(gate_logits)
         gate_weights.scatter_(-1, topk_idx, topk_weights)
         importance = gate_weights.sum(dim=0)
         CV = torch.std(importance) / (torch.mean(importance) + 1e-10)
 
+        # ---- Expert computation ----
+        # Stack outputs from all experts: [N, num_experts, out_size]
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)
+        
+        # Weight and aggregate: [N, num_experts] x [N, num_experts, out_size] -> [N, out_size]
+        output = torch.einsum('ne,neo->no', gate_weights, expert_outputs)
+        
         return output, CV
 
 
