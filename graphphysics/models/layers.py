@@ -182,63 +182,75 @@ class MoE(nn.Module):
         self.noise_layer = nn.Linear(in_size, num_experts, bias=False)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass of the MoE layer with efficient token duplication and sorting.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (num_items, in_size).
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-                - output (torch.Tensor): Output tensor of shape (num_items, out_size).
-                - CV (torch.Tensor): Coefficient of variation of expert importance.
-        """
         N = x.shape[0]
 
         # ---- Gating ----
         gate_logits = self.gate_layer(x)  # (N, num_experts)
-        gate_logits = gate_logits + torch.randn(()) * torch.nn.functional.softplus(self.noise_layer(x))
-        topk_vals, topk_idx = torch.topk(gate_logits, self.num_top_experts, dim=-1)  # (N, k)
+        gate_logits = gate_logits + torch.randn(()) * torch.nn.functional.softplus(
+            self.noise_layer(x)
+        )
+
+        topk_vals, topk_idx = torch.topk(
+            gate_logits, self.num_top_experts, dim=-1
+        )  # (N, k)
         topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)  # (N, k)
 
-        # ---- Duplicate tokens ----
-        x_rep = x.repeat_interleave(self.num_top_experts, dim=0)  # (N*k, in_size)
-        weights = topk_weights.reshape(-1)  # (N*k)
-        expert_ids = topk_idx.reshape(-1)  # (N*k)
-        token_ids = torch.arange(N, device=x.device).repeat_interleave(self.num_top_experts)  # (N*k)
+        # ---- Token duplication ----
+        x_rep = x.repeat_interleave(self.num_top_experts, dim=0)          # (N*k, in_size)
+        weights = topk_weights.reshape(-1)                                # (N*k)
+        expert_ids = topk_idx.reshape(-1)                                 # (N*k)
+        token_ids = torch.arange(N, device=x.device).repeat_interleave(
+            self.num_top_experts
+        )                                                                 # (N*k)
 
-        # ---- Sort by expert ----
-        sort_idx = torch.argsort(expert_ids)
-        x_rep = x_rep[sort_idx]
-        weights = weights[sort_idx]
-        expert_ids = expert_ids[sort_idx]
-        token_ids = token_ids[sort_idx]
+        counts = torch.bincount(
+            expert_ids, minlength=self.num_experts
+        )  # (num_experts,)
+
+        # prefix sums → expert segments
+        offsets = torch.cumsum(counts, dim=0)
+        starts = offsets - counts
+
+        # reorder buffers by expert
+        perm = torch.empty_like(expert_ids)
+        cursor = starts.clone()
+
+        perm[cursor[expert_ids]] = torch.arange(
+            expert_ids.size(0), device=x.device
+        )
+        cursor[expert_ids] += 1
+
+        x_rep = x_rep[perm]
+        weights = weights[perm]
+        token_ids = token_ids[perm]
 
         # ---- Output buffer ----
-        output = torch.zeros(N, self.out_size, device=x.device, dtype=x.dtype)
+        output = torch.zeros(
+            N, self.out_size, device=x.device, dtype=x.dtype
+        )
 
-        # ---- Expert forwards ----
+        # ---- Expert forwards (clean & fast) ----
         start = 0
-        for expert_id in range(self.num_experts):
-            mask = expert_ids == expert_id
-            count = mask.sum().item()
+        for expert_id, count in enumerate(counts.tolist()):
             if count == 0:
                 continue
 
-            expert_input = x_rep[start:start + count]
-            expert_output = self.experts[expert_id](expert_input)  # (count, out_size)
-            expert_output = expert_output * weights[start:start + count].unsqueeze(-1)
-            output.index_add_(0, token_ids[start:start + count], expert_output)
+            end = start + count
+            expert_input = x_rep[start:end]
+            expert_output = self.experts[expert_id](expert_input)
+            expert_output *= weights[start:end].unsqueeze(-1)
 
-            start += count
+            output.index_add_(0, token_ids[start:end], expert_output)
+            start = end
 
-        # Computing the coefficient of variation (CV) of expert importance
+        # ---- CV (UNCHANGED, volontairement) ----
         gate_weights = torch.zeros_like(gate_logits)
         gate_weights.scatter_(-1, topk_idx, topk_weights)
-        importance = gate_weights.sum(dim=0)  # Shape: (num_experts,)
+        importance = gate_weights.sum(dim=0)
         CV = torch.std(importance) / (torch.mean(importance) + 1e-10)
 
         return output, CV
+
 
 
 def build_moe(
