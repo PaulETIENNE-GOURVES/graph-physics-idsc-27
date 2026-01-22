@@ -197,18 +197,23 @@ class MoE(nn.Module):
 
         # Only compute the top-k experts that are actually selected
         batch_shape = x.shape[:-1]
-        output_size = self.experts[0](x[..., :1]).shape[-1]
+        
+        # Pre-compute outputs only for experts that are actually selected
+        expert_outputs_dict = {}
+        unique_experts = torch.unique(topk_indices)
+        
+        for expert_idx in unique_experts:
+            expert_outputs_dict[expert_idx.item()] = self.experts[expert_idx.item()](x)
+        
+        # Gather outputs for selected experts at each top-k position
+        output_size = next(iter(expert_outputs_dict.values())).shape[-1]
         topk_outputs = torch.zeros(*batch_shape, self.num_top_experts, output_size, device=x.device, dtype=x.dtype)
         
-        # For each top-k position, compute only the experts that are selected
         for k in range(self.num_top_experts):
             expert_indices = topk_indices[..., k]  # Shape: (batch_size,)
-            unique_experts = torch.unique(expert_indices)
-            
-            # Compute each unique expert only once for the samples that selected it
             for expert_idx in unique_experts:
                 mask = expert_indices == expert_idx
-                topk_outputs[mask, k] = self.experts[expert_idx.item()](x[mask])
+                topk_outputs[mask, k] = expert_outputs_dict[expert_idx.item()][mask]
         
         # Weight outputs by gate weights
         output = (topk_outputs * topk_weights.unsqueeze(-1)).sum(dim=-2)  # Shape: (..., out_size)
