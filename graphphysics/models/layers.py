@@ -120,6 +120,7 @@ def keeptopk(tensor: torch.Tensor, k):
     topk_values, topk_indices = torch.topk(tensor, k, dim=-1)
     mask = (- torch.ones_like(tensor) * torch.inf).scatter_(-1, topk_indices, 0)
     return tensor + mask
+
 class MoE(nn.Module):
     """
     Mixture of Experts (MoE) Layer.
@@ -177,7 +178,7 @@ class MoE(nn.Module):
         self.gate_layer = nn.Linear(in_size, num_experts, bias=False)
         self.noise_layer = nn.Linear(in_size, num_experts, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the MoE layer.
 
@@ -185,12 +186,17 @@ class MoE(nn.Module):
             x (torch.Tensor): Input tensor of shape (..., in_size).
 
         Returns:
-            torch.Tensor: Output tensor of shape (..., out_size).
+            tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+                - output (torch.Tensor): Output tensor of shape (..., out_size).
+                - CV (torch.Tensor): Coefficient of variation of expert importance.
         """
         gate_logits = self.gate_layer(x)
         gate_logits = gate_logits + torch.randn(()) * torch.nn.functional.softplus(self.noise_layer(x))  # Shape: (..., num_experts)
         gate_logits = keeptopk(gate_logits, self.num_top_experts) # Keep top-k logits
         gate_weights = torch.softmax(gate_logits, dim=-1)  # Shape: (..., num_experts)
+
+        importance = gate_weights.sum(dim=0)  # Shape: (num_experts,)
+        CV = torch.std(importance) / (torch.mean(importance) + 1e-10)
 
         expert_outputs = torch.stack(
             [expert(x) for expert in self.experts], dim=-2
@@ -199,7 +205,7 @@ class MoE(nn.Module):
         # Weighted sum of expert outputs
         output = expert_outputs * gate_weights.unsqueeze(-1) # Shape: (..., num_experts, out_size)
         output = output.sum(dim=-2)  # Shape: (..., out_size)
-        return output
+        return output, CV
 
 
 def build_moe(
@@ -479,7 +485,7 @@ class GraphNetBlock(MessagePassing):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         size: int = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Forward pass of the GraphNetBlock.
 
@@ -491,27 +497,27 @@ class GraphNetBlock(MessagePassing):
                 Defaults to None.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Updated node features and edge features.
+            Tuple[torch.Tensor, torch.Tensor, dict]: Updated node features, edge features, and CV terms dict.
         """
         # Update edge attributes
         row, col = edge_index
         x_i = x[col]  # Target node features
         x_j = x[row]  # Source node features
-        edge_attr_ = self.edge_update(edge_attr, x_i, x_j)
+        edge_attr_, edge_cv = self.edge_update(edge_attr, x_i, x_j)
 
         # Perform message passing and update node features
-        x_ = self.propagate(
+        x_, node_cv = self.propagate(
             edge_index, x=x, edge_attr=edge_attr_, size=(x.size(0), x.size(0))
         )
 
         edge_attr = edge_attr + edge_attr_
         x = x + x_
 
-        return x, edge_attr
+        return x, edge_attr, {"edge_cv": edge_cv, "node_cv": node_cv}
 
     def edge_update(
         self, edge_attr: torch.Tensor, x_i: torch.Tensor, x_j: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Updates edge features.
 
@@ -521,11 +527,11 @@ class GraphNetBlock(MessagePassing):
             x_j (torch.Tensor): Source node features [num_edges, hidden_size].
 
         Returns:
-            torch.Tensor: Updated edge features [num_edges, hidden_size].
+            tuple[torch.Tensor, torch.Tensor]: Updated edge features and CV term.
         """
         edge_input = torch.cat([edge_attr, x_i, x_j], dim=-1)
-        edge_attr = self.edge_block(edge_input)
-        return edge_attr
+        edge_attr, edge_cv = self.edge_block(edge_input)
+        return edge_attr, edge_cv
 
     def message(self, edge_attr: torch.Tensor) -> torch.Tensor:
         """
@@ -539,7 +545,7 @@ class GraphNetBlock(MessagePassing):
         """
         return edge_attr
 
-    def update(self, aggr_out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def update(self, aggr_out: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Updates node features after aggregation.
 
@@ -548,8 +554,8 @@ class GraphNetBlock(MessagePassing):
             x (torch.Tensor): Node features [num_nodes, hidden_size].
 
         Returns:
-            torch.Tensor: Updated node features [num_nodes, hidden_size].
+            tuple[torch.Tensor, torch.Tensor]: Updated node features and CV term.
         """
         node_input = torch.cat([x, aggr_out], dim=-1)
-        x = self.node_block(node_input)
-        return x
+        x, node_cv = self.node_block(node_input)
+        return x, node_cv
