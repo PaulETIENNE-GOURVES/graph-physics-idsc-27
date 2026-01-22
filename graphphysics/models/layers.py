@@ -195,26 +195,23 @@ class MoE(nn.Module):
         topk_values, topk_indices = torch.topk(gate_logits, self.num_top_experts, dim=-1)
         topk_weights = torch.softmax(topk_values, dim=-1)  # Shape: (..., num_top_experts)
 
-        # Only compute outputs for experts with nonzero weights (top-k experts)
-        batch_size = x.shape[0] if len(x.shape) > 1 else 1
-        expert_outputs = []
+        # Only compute the top-k experts that are actually selected
+        batch_shape = x.shape[:-1]
+        output_size = self.experts[0](x[..., :1]).shape[-1]
+        topk_outputs = torch.zeros(*batch_shape, self.num_top_experts, output_size, device=x.device, dtype=x.dtype)
         
+        # For each top-k position, compute only the experts that are selected
         for k in range(self.num_top_experts):
-            expert_idx = topk_indices[..., k]  # Shape: (...,)
-            if len(x.shape) > 1:
-                # Batch processing: run each expert only for samples that selected it
-                expert_out = torch.zeros(x.shape[:-1] + (self.experts[0](x[:1]).shape[-1],), device=x.device, dtype=x.dtype)
-                for i in range(batch_size):
-                    idx = expert_idx[i].item() if expert_idx[i].dim() == 0 else expert_idx[i]
-                    expert_out[i] = self.experts[idx](x[i:i+1]).squeeze(0)
-            else:
-                expert_out = self.experts[expert_idx](x)
-            expert_outputs.append(expert_out)
-        
-        expert_outputs = torch.stack(expert_outputs, dim=-2)  # Shape: (..., num_top_experts, out_size)
+            expert_indices = topk_indices[..., k]  # Shape: (batch_size,)
+            unique_experts = torch.unique(expert_indices)
+            
+            # Compute each unique expert only once for the samples that selected it
+            for expert_idx in unique_experts:
+                mask = expert_indices == expert_idx
+                topk_outputs[mask, k] = self.experts[expert_idx.item()](x[mask])
         
         # Weight outputs by gate weights
-        output = (expert_outputs * topk_weights.unsqueeze(-1)).sum(dim=-2)  # Shape: (..., out_size)
+        output = (topk_outputs * topk_weights.unsqueeze(-1)).sum(dim=-2)  # Shape: (..., out_size)
         
         # Computing the coefficient of variation (CV) of expert importance
         gate_weights = torch.zeros_like(gate_logits)
