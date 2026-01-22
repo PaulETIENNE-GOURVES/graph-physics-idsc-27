@@ -233,7 +233,7 @@ class LightningModule(L.LightningModule):
         self.val_step_outputs.append(predicted_outputs.cpu())
         self.val_step_targets.append(target.cpu())
         val_loss = self.loss(
-            target=predicted_outputs,
+            target=target,
             network_output=predicted_outputs,
             node_type=node_type,
             masks=self.loss_masks,
