@@ -183,40 +183,58 @@ class MoE(nn.Module):
         Forward pass of the MoE layer.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (..., in_size).
+            x (torch.Tensor): Input tensor of shape (num_items, in_size).
 
         Returns:
             tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-                - output (torch.Tensor): Output tensor of shape (..., out_size).
+                - output (torch.Tensor): Output tensor of shape (num_items, out_size).
                 - CV (torch.Tensor): Coefficient of variation of expert importance.
         """
         gate_logits = self.gate_layer(x)
-        gate_logits = gate_logits + torch.randn(()) * torch.nn.functional.softplus(self.noise_layer(x))  # Shape: (..., num_experts)
+        gate_logits = gate_logits + torch.randn(()) * torch.nn.functional.softplus(self.noise_layer(x))  # Shape: (num_items, num_experts)
         topk_values, topk_indices = torch.topk(gate_logits, self.num_top_experts, dim=-1)
-        topk_weights = torch.softmax(topk_values, dim=-1)  # Shape: (..., num_top_experts)
+        topk_weights = torch.softmax(topk_values, dim=-1)  # Shape: (num_items, num_top_experts)
 
-        # Only compute the top-k experts that are actually selected
-        batch_shape = x.shape[:-1]
-        
-        # Pre-compute outputs only for experts that are actually selected
-        expert_outputs_dict = {}
+        # Get all unique expert indices that have nonzero weights
         unique_experts = torch.unique(topk_indices)
         
+        # Pre-compute outputs only for experts with nonzero weights
+        # Only pass inputs that selected each expert
+        expert_outputs_dict = {}
         for expert_idx in unique_experts:
-            expert_outputs_dict[expert_idx.item()] = self.experts[expert_idx.item()](x)
+            expert_idx_item = expert_idx.item()
+            # Find which items selected this expert at any top-k position
+            mask = (topk_indices == expert_idx).any(dim=1)
+            # Only pass those inputs to the expert
+            expert_outputs_dict[expert_idx_item] = self.experts[expert_idx_item](x[mask])
         
-        # Gather outputs for selected experts at each top-k position
+        # Initialize output tensor
+        num_items = x.shape[0]
         output_size = next(iter(expert_outputs_dict.values())).shape[-1]
-        topk_outputs = torch.zeros(*batch_shape, self.num_top_experts, output_size, device=x.device, dtype=x.dtype)
+        topk_outputs = torch.zeros(num_items, self.num_top_experts, output_size, device=x.device, dtype=x.dtype)
         
-        for k in range(self.num_top_experts):
-            expert_indices = topk_indices[..., k]  # Shape: (batch_size,)
-            for expert_idx in unique_experts:
-                mask = expert_indices == expert_idx
-                topk_outputs[mask, k] = expert_outputs_dict[expert_idx.item()][mask]
+        # Fill in outputs for each item and top-k position
+        for expert_idx in unique_experts:
+            expert_idx_item = expert_idx.item()
+            # Mask for items that selected this expert
+            mask = (topk_indices == expert_idx).any(dim=1)
+            # Get the expert outputs (only computed for selected items)
+            expert_out = expert_outputs_dict[expert_idx_item]
+            
+            # For each top-k position where this expert was selected
+            for k in range(self.num_top_experts):
+                # Mask for items that selected this expert at position k
+                mask_k = topk_indices[:, k] == expert_idx
+                # Map back to indices in the subset
+                subset_indices = torch.arange(mask.sum(), device=x.device)
+                subset_to_full = torch.where(mask)[0]
+                
+                # Get indices in the expert output
+                expert_indices = torch.searchsorted(subset_to_full, torch.where(mask_k)[0])
+                topk_outputs[mask_k, k] = expert_out[expert_indices]
         
-        # Weight outputs by gate weights
-        output = (topk_outputs * topk_weights.unsqueeze(-1)).sum(dim=-2)  # Shape: (..., out_size)
+        # Weighted sum of top-k expert outputs
+        output = (topk_outputs * topk_weights.unsqueeze(-1)).sum(dim=1)  # Shape: (num_items, out_size)
         
         # Computing the coefficient of variation (CV) of expert importance
         gate_weights = torch.zeros_like(gate_logits)
