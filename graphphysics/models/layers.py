@@ -192,19 +192,36 @@ class MoE(nn.Module):
         """
         gate_logits = self.gate_layer(x)
         gate_logits = gate_logits + torch.randn(()) * torch.nn.functional.softplus(self.noise_layer(x))  # Shape: (..., num_experts)
-        gate_logits = keeptopk(gate_logits, self.num_top_experts) # Keep top-k logits
-        gate_weights = torch.softmax(gate_logits, dim=-1)  # Shape: (..., num_experts)
+        topk_values, topk_indices = torch.topk(gate_logits, self.num_top_experts, dim=-1)
+        topk_weights = torch.softmax(topk_values, dim=-1)  # Shape: (..., num_top_experts)
 
+        # Only compute outputs for experts with nonzero weights (top-k experts)
+        batch_size = x.shape[0] if len(x.shape) > 1 else 1
+        expert_outputs = []
+        
+        for k in range(self.num_top_experts):
+            expert_idx = topk_indices[..., k]  # Shape: (...,)
+            if len(x.shape) > 1:
+                # Batch processing: run each expert only for samples that selected it
+                expert_out = torch.zeros(x.shape[:-1] + (self.experts[0](x[:1]).shape[-1],), device=x.device, dtype=x.dtype)
+                for i in range(batch_size):
+                    idx = expert_idx[i].item() if expert_idx[i].dim() == 0 else expert_idx[i]
+                    expert_out[i] = self.experts[idx](x[i:i+1]).squeeze(0)
+            else:
+                expert_out = self.experts[expert_idx](x)
+            expert_outputs.append(expert_out)
+        
+        expert_outputs = torch.stack(expert_outputs, dim=-2)  # Shape: (..., num_top_experts, out_size)
+        
+        # Weight outputs by gate weights
+        output = (expert_outputs * topk_weights.unsqueeze(-1)).sum(dim=-2)  # Shape: (..., out_size)
+        
+        # Computing the coefficient of variation (CV) of expert importance
+        gate_weights = torch.zeros_like(gate_logits)
+        gate_weights.scatter_(-1, topk_indices, topk_weights)
         importance = gate_weights.sum(dim=0)  # Shape: (num_experts,)
         CV = torch.std(importance) / (torch.mean(importance) + 1e-10)
 
-        expert_outputs = torch.stack(
-            [expert(x) for expert in self.experts], dim=-2
-        )  # Shape: (..., num_experts, out_size)
-
-        # Weighted sum of expert outputs
-        output = expert_outputs * gate_weights.unsqueeze(-1) # Shape: (..., num_experts, out_size)
-        output = output.sum(dim=-2)  # Shape: (..., out_size)
         return output, CV
 
 
