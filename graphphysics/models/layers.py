@@ -185,71 +185,55 @@ class MoE(nn.Module):
         N = x.shape[0]
 
         # ---- Gating ----
-        gate_logits = self.gate_layer(x)  # (N, num_experts)
+        gate_logits = self.gate_layer(x)
         gate_logits = gate_logits + torch.randn(()) * torch.nn.functional.softplus(
             self.noise_layer(x)
         )
 
         topk_vals, topk_idx = torch.topk(
             gate_logits, self.num_top_experts, dim=-1
-        )  # (N, k)
-        topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)  # (N, k)
+        )
+        topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)
 
         # ---- Token duplication ----
-        x_rep = x.repeat_interleave(self.num_top_experts, dim=0)          # (N*k, in_size)
-        weights = topk_weights.reshape(-1)                                # (N*k)
-        expert_ids = topk_idx.reshape(-1)                                 # (N*k)
+        x_rep = x.repeat_interleave(self.num_top_experts, dim=0)
+        weights = topk_weights.reshape(-1)
+        expert_ids = topk_idx.reshape(-1)
         token_ids = torch.arange(N, device=x.device).repeat_interleave(
             self.num_top_experts
-        )                                                                 # (N*k)
+        )
 
+        # ---- Count tokens per expert ----
         counts = torch.bincount(
             expert_ids, minlength=self.num_experts
-        )  # (num_experts,)
-
-        # prefix sums → expert segments
-        offsets = torch.cumsum(counts, dim=0)
-        starts = offsets - counts
-
-        # reorder buffers by expert
-        perm = torch.empty_like(expert_ids)
-        cursor = starts.clone()
-
-        perm[cursor[expert_ids]] = torch.arange(
-            expert_ids.size(0), device=x.device
         )
-        cursor[expert_ids] += 1
-
-        x_rep = x_rep[perm]
-        weights = weights[perm]
-        token_ids = token_ids[perm]
 
         # ---- Output buffer ----
-        output = torch.zeros(
-            N, self.out_size, device=x.device, dtype=x.dtype
-        )
+        output = torch.zeros(N, self.out_size, device=x.device, dtype=x.dtype)
 
-        # ---- Expert forwards (clean & fast) ----
+        # ---- Expert forwards (SAFE, NO MASKS) ----
         start = 0
         for expert_id, count in enumerate(counts.tolist()):
             if count == 0:
                 continue
 
-            end = start + count
-            expert_input = x_rep[start:end]
+            # select tokens for this expert
+            idx = (expert_ids == expert_id).nonzero(as_tuple=True)[0]
+
+            expert_input = x_rep[idx]
             expert_output = self.experts[expert_id](expert_input)
-            expert_output *= weights[start:end].unsqueeze(-1)
+            expert_output *= weights[idx].unsqueeze(-1)
 
-            output.index_add_(0, token_ids[start:end], expert_output)
-            start = end
+            output.index_add_(0, token_ids[idx], expert_output)
 
-        # ---- CV (UNCHANGED, volontairement) ----
+        # ---- CV (unchanged) ----
         gate_weights = torch.zeros_like(gate_logits)
         gate_weights.scatter_(-1, topk_idx, topk_weights)
         importance = gate_weights.sum(dim=0)
         CV = torch.std(importance) / (torch.mean(importance) + 1e-10)
 
         return output, CV
+
 
 
 
