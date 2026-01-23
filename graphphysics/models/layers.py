@@ -218,7 +218,7 @@ def build_moe(
     hidden_size: int,
     out_size: int,
     num_experts: int = 6,
-    num_top_experts: int = 2,
+    num_top_experts: int = 1,
     nb_of_layers: int = 2,
     layer_norm: bool = True,
 ) -> nn.Module:
